@@ -1477,13 +1477,21 @@ pub(crate) async fn execute_non_stream_request(
         }
     }
 
-    // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
-    // finish() 返回 IncompleteJson。已有错误则保持不变。
-    if tool_json_error.is_none()
-        && let Err(e) = tool_accumulator.finish()
-    {
-        tracing::error!("{}", e);
-        tool_json_error = Some(e);
+    // 收尾：无参工具的 0 字节滞留缓冲在此还原为 {} 补进 content；累积了非空内容
+    // 却从未收到 stop=true 的（上游在参数写到一半时截断）返回 IncompleteJson。
+    // 已有错误则保持不变。
+    if tool_json_error.is_none() {
+        match tool_accumulator.finish(&tool_name_map) {
+            Ok(recovered) => {
+                for completed in recovered {
+                    tool_uses.push(completed.to_anthropic_block());
+                }
+            }
+            Err(e) => {
+                tracing::error!("{}", e);
+                tool_json_error = Some(e);
+            }
+        }
     }
 
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
