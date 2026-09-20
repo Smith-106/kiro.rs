@@ -311,7 +311,16 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 
     match map_model(model) {
-        // GPT-5.6 family on Kiro ships a 272K context window.
+        // Kiro exposes the GPT-5.6 family with a 1M context window.
+        Some(mapped)
+            if matches!(
+                mapped.as_str(),
+                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+            ) =>
+        {
+            1_000_000
+        }
+        // Keep the existing fallback for other GPT models until their limits are confirmed.
         Some(mapped) if mapped.starts_with("gpt") => 272_000,
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
@@ -2241,10 +2250,17 @@ mod tests {
     #[test]
     fn test_map_model_gpt_5_6_family() {
         // Kiro serves the GPT-5.6 family; ids pass through verbatim.
-        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
-        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
-        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
-        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(map_model(model), Some(model.to_string()));
+            assert_eq!(
+                get_context_window_size(model),
+                1_000_000,
+                "{model} should use the 1M context window"
+            );
+        }
+
+        // Do not silently expand unconfirmed GPT model windows.
+        assert_eq!(get_context_window_size("gpt-5.5"), 272_000);
     }
 
     #[test]
