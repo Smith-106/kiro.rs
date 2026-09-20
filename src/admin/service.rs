@@ -43,6 +43,7 @@ use super::types::{
     CredentialsExportResponse, CredentialsStatusResponse, CustomModelsConfigResponse, CustomModelItem,
     EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    ModelApiRetryConfigResponse,
     CredentialMetadataSchemaConfig,
     CacheMeteringConfigResponse, SetCacheMeteringConfigRequest,
     SessionAffinityConfigResponse, SetSessionAffinityConfigRequest,
@@ -50,7 +51,7 @@ use super::types::{
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
     SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest,
+    SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
     SetSelfHealConfigRequest, SetCustomModelsRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -2405,7 +2406,7 @@ impl AdminService {
         Ok(self.get_session_affinity_config())
     }
 
-    /// 获取账号级风控故障转移配置
+    /// 获取账号级 429 限流故障转移配置
     pub fn get_account_throttle_config(&self) -> AccountThrottleConfigResponse {
         AccountThrottleConfigResponse {
             failover: self.token_manager.get_account_throttle_failover(),
@@ -2413,7 +2414,7 @@ impl AdminService {
         }
     }
 
-    /// 更新账号级风控故障转移配置
+    /// 更新账号级 429 限流故障转移配置
     pub fn set_account_throttle_config(
         &self,
         req: SetAccountThrottleConfigRequest,
@@ -2429,6 +2430,25 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取普通模型 API 429 自动重试配置
+    pub fn get_model_api_retry_config(&self) -> ModelApiRetryConfigResponse {
+        ModelApiRetryConfigResponse {
+            enabled: self.token_manager.get_model_api_429_retry_enabled(),
+        }
+    }
+
+    /// 更新普通模型 API 429 自动重试配置
+    pub fn set_model_api_retry_config(
+        &self,
+        req: SetModelApiRetryConfigRequest,
+    ) -> Result<ModelApiRetryConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_model_api_429_retry_enabled(req.enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_model_api_retry_config())
     }
 
     /// 获取单账号 RPM 限流配置

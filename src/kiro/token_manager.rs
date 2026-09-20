@@ -1234,10 +1234,12 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// 会话粘性路由：会话 → 上一轮成功凭据 的绑定表（运行时可开关 / 改 TTL）
     session_affinity: SessionAffinity,
-    /// 账号级 429 风控故障转移开关（运行时可修改）
+    /// 账号级 429 限流故障转移开关（运行时可修改）
     account_throttle_failover: AtomicBool,
-    /// 账号级风控冷却时长（秒，运行时可修改）
+    /// 账号级 429 限流冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 普通模型 API 429 自动重试开关（运行时可修改）
+    model_api_429_retry_enabled: AtomicBool,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1468,6 +1470,7 @@ impl MultiTokenManager {
         );
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let model_api_429_retry_enabled = config.model_api_429_retry_enabled;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
@@ -1490,6 +1493,7 @@ impl MultiTokenManager {
             session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            model_api_429_retry_enabled: AtomicBool::new(model_api_429_retry_enabled),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -3282,10 +3286,10 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 标记凭据进入临时冷却期（账号级 429 风控触发）
+    /// 标记凭据进入临时冷却期（账号级 429 限流触发）
     ///
-    /// 与 `report_failure` 不同：不计入永久禁用，到期自动恢复，可用于"`suspicious activity` 429"
-    /// 这种短期账号级风控——当前凭据先冷却 N 分钟，故障转移到其它凭据。
+    /// 与 `report_failure` 不同：不计入永久禁用，到期自动恢复。账号级限流时
+    /// 当前凭据先冷却 N 分钟，再故障转移到其它凭据。
     ///
     /// 标记凭据冷却，并在同一锁临界区内返回当前请求范围的剩余凭据数。
     pub fn report_account_throttled_for_request(
@@ -3305,10 +3309,10 @@ impl MultiTokenManager {
                     Some(prev) if prev > until => prev,
                     _ => until,
                 });
-                // 计入累计失败（账号风控不动连续 failure_count，避免冷却结束后误禁用）
+                // 计入累计失败（账号限流不动连续 failure_count，避免冷却结束后误禁用）
                 entry.total_failure_count += 1;
                 tracing::warn!(
-                    "凭据 #{} 触发账号级风控，冷却 {} 秒",
+                    "凭据 #{} 触发账号级限流，冷却 {} 秒",
                     id,
                     cooldown.as_secs()
                 );
@@ -3339,7 +3343,7 @@ impl MultiTokenManager {
             .find(|e| e.id == id)
             .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
         entry.throttled_until = None;
-        tracing::info!("凭据 #{} 风控冷却已被手动解除", id);
+        tracing::info!("凭据 #{} 限流冷却已被手动解除", id);
         Ok(())
     }
 
@@ -4437,17 +4441,17 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 获取账号级风控故障转移配置（Admin API）
+    /// 获取账号级 429 限流故障转移配置（Admin API）
     pub fn get_account_throttle_failover(&self) -> bool {
         self.account_throttle_failover.load(Ordering::Relaxed)
     }
 
-    /// 获取账号级风控冷却时长秒数（Admin API）
+    /// 获取账号级 429 限流冷却时长秒数（Admin API）
     pub fn get_account_throttle_cooldown_secs(&self) -> u64 {
         self.account_throttle_cooldown_secs.load(Ordering::Relaxed)
     }
 
-    /// 设置账号级风控故障转移配置（Admin API）
+    /// 设置账号级 429 限流故障转移配置（Admin API）
     ///
     /// 任一参数传 `None` 表示不修改该字段。
     pub fn set_account_throttle_config(
@@ -4488,7 +4492,7 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "账号级风控配置已更新: failover={}, cooldown_secs={}",
+            "账号级 429 限流配置已更新: failover={}, cooldown_secs={}",
             new_failover,
             new_cooldown
         );
@@ -4548,6 +4552,33 @@ impl MultiTokenManager {
             new_enabled,
             new_ttl
         );
+        Ok(())
+    }
+
+    /// 获取普通模型 API 429 自动重试配置（Admin API）。
+    pub fn get_model_api_429_retry_enabled(&self) -> bool {
+        self.model_api_429_retry_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 设置普通模型 API 429 自动重试配置（Admin API）。
+    pub fn set_model_api_429_retry_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+        let previous = self.get_model_api_429_retry_enabled();
+        if previous == enabled {
+            return Ok(());
+        }
+
+        self.model_api_429_retry_enabled
+            .store(enabled, Ordering::Relaxed);
+        if let Err(err) = self.update_config_file(move |config| {
+            config.model_api_429_retry_enabled = enabled;
+        }) {
+            self.model_api_429_retry_enabled
+                .store(previous, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!("普通模型 API 429 自动重试已设置为: {}", enabled);
         Ok(())
     }
 
@@ -5951,6 +5982,29 @@ mod tests {
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.load_balancing_mode, "balanced");
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn model_api_429_retry_update_is_immediate_and_persisted() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-model-api-429-retry-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        assert!(manager.get_model_api_429_retry_enabled());
+        manager.set_model_api_429_retry_enabled(false).unwrap();
+        assert!(!manager.get_model_api_429_retry_enabled());
+        assert!(!Config::load(&config_path)
+            .unwrap()
+            .model_api_429_retry_enabled);
 
         std::fs::remove_file(&config_path).unwrap();
     }
