@@ -1462,7 +1462,13 @@ impl StreamContext {
             );
         }
 
-        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // contextUsage 覆盖的是生成结束后的整个上下文（含本轮输出），
+        // 先扣掉本轮输出再做 cache 分摊，避免输出被计两次。
+        let total_real = crate::token::input_tokens_excluding_output(
+            self.context_input_tokens,
+            self.input_tokens,
+            self.output_tokens,
+        );
         self.cache_usage.split_against_total(total_real)
     }
 
@@ -5475,8 +5481,50 @@ mod tests {
             prompt_total_est: 100,
         };
 
-        assert_eq!(ctx.resolved_usage(), (40, 20, 20));
+        // context 80 - output 9 = 71；按 cache_covered_est/prompt_total_est = 50/100
+        // 分摊：cache_total = round(71 * 0.5) = 36，read = round(36 * 25/50) = 18，
+        // creation = 36 - 18 = 18，uncached tail = 71 - 36 = 35。
+        assert_eq!(ctx.resolved_usage(), (35, 18, 18));
+        let (input, creation, read) = ctx.resolved_usage();
+        assert_eq!(
+            input + creation + read,
+            71,
+            "分摊必须发生在扣减之后，三份之和等于修正后的 total"
+        );
         assert_eq!(ctx.resolved_output_tokens(), 9);
+    }
+
+    #[test]
+    fn stream_usage_without_context_usage_does_not_subtract_output() {
+        use crate::anthropic::cache_metering::CacheUsage;
+
+        let make = |output_tokens: i32| {
+            let mut ctx = StreamContext::new_with_thinking(
+                "claude-opus-4-7",
+                100,
+                false,
+                HashMap::new(),
+                test_known_tools(),
+            );
+            ctx.context_input_tokens = None;
+            ctx.output_tokens = output_tokens;
+            ctx.cache_usage = CacheUsage {
+                cache_read: 25,
+                cache_covered_est: 50,
+                prompt_total_est: 100,
+            };
+            ctx.resolved_usage()
+        };
+
+        // 回退值来自 count_all_tokens 的 prompt 估算，本就不含输出：
+        // output 取 0 还是 9，分摊结果必须完全一致。
+        assert_eq!(make(9), make(0));
+        let (input, creation, read) = make(9);
+        assert_eq!(
+            input + creation + read,
+            100,
+            "回退分支的 total 仍是 input_tokens 原值"
+        );
     }
 
     #[test]
