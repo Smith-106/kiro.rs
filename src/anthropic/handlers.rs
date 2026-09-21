@@ -141,6 +141,12 @@ pub(crate) struct RequestTracer {
     /// 首次选号的路由决策。web_search 一条 trace 内多次 provider 调用，
     /// 「是否沿用了上一轮账号」只看第一次。
     route: parking_lot::Mutex<Option<TraceRoute>>,
+    /// 是否已落库。[`finalize`](Self::finalize) 首次进入即置位，保证同一条 trace
+    /// 只写一行；[`Drop`] 兜底时据此判断「本请求从未正常收尾」。
+    finalized: std::sync::atomic::AtomicBool,
+    /// provider 成功返回 `reqwest::Response`，即已收到上游 HTTP 响应头。
+    /// 不能用「尚未 finalize」代替这个状态：下游可能在读取 body 前取消。
+    upstream_headers_received: std::sync::atomic::AtomicBool,
 }
 
 /// usage 三项的来源，落到 trace 行便于区分「上游真值」与「本地估算」。
@@ -218,7 +224,16 @@ impl RequestTracer {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// 标记 provider 已成功返回响应头。应在取得 `reqwest::Response` 后立刻调用，
+    /// 在创建/轮询下游 response body 之前完成。
+    pub(super) fn mark_upstream_headers_received(&self) {
+        self.upstream_headers_received
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
@@ -241,6 +256,13 @@ impl RequestTracer {
         interrupted_after_bytes: Option<u64>,
         usage: TraceUsage,
     ) {
+        // 幂等：首次进入置位，防止显式收尾后 Drop 兜底再写一次（insert 按 trace_id 覆盖）。
+        if self
+            .finalized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let Some(store) = &self.store else { return };
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
@@ -278,6 +300,43 @@ impl RequestTracer {
             attempts,
         };
         store.insert(&rec);
+    }
+}
+
+/// 兜底落库：请求被取消、走不到任何显式 finalize 时补一行。
+///
+/// `upstream_headers_received=false` 才表示请求仍在等待上游响应头；若 headers 已到
+/// 但 body 尚未被读取/收尾，则应归为流中断，不能误报为等头超时。
+///
+/// 只记录可观测到的事实（头未到达即被取消），不推断原因：此处无法区分前置 SLB 等头超时、
+/// 客户端读超时、用户主动中断、客户端进程退出等——它们在这一层长得完全一样。原因需结合
+/// `duration_ms`（如贴近 SLB 的等头超时值）与下游日志判断。
+///
+/// 已正常收尾的请求已置位 `finalized`，幂等守卫使此处成为空操作，不会双写或覆盖。
+impl Drop for RequestTracer {
+    fn drop(&mut self) {
+        let headers_received = self
+            .upstream_headers_received
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (error_type, message) = if headers_received {
+            (
+                outcome::STREAM_INTERRUPTED,
+                "request was cancelled after upstream response headers arrived",
+            )
+        } else {
+            (
+                outcome::ABANDONED_BEFORE_HEADERS,
+                "request was cancelled while awaiting upstream response headers",
+            )
+        };
+        // final_status 复用 "interrupted"（前端归入「中断」徽章），靠 error_type 区分具体类型。
+        self.finalize(
+            "interrupted",
+            Some(error_type),
+            Some(message),
+            None,
+            TraceUsage::zero(),
+        );
     }
 }
 
@@ -967,6 +1026,7 @@ async fn handle_stream_request(
             return map_provider_error(e);
         }
     };
+    tracer.mark_upstream_headers_received();
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
@@ -1323,6 +1383,7 @@ pub(crate) async fn execute_non_stream_request(
             return Err(NonStreamExecutionError::Provider(e));
         }
     };
+    tracer.mark_upstream_headers_received();
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
@@ -2016,6 +2077,7 @@ async fn handle_stream_request_buffered(
             return map_provider_error(e);
         }
     };
+    tracer.mark_upstream_headers_received();
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
@@ -2057,6 +2119,7 @@ fn create_buffered_sse_stream(
     tracer: std::sync::Arc<RequestTracer>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
+    let settlement = BufferedStreamSettlement::new(hook, credential_id, tracer, &ctx);
 
     stream::unfold(
         (
@@ -2065,12 +2128,10 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            hook,
-            credential_id,
-            tracer,
+            settlement,
             0u64,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement, mut sent_bytes)| async move {
             if finished {
                 return None;
             }
@@ -2085,14 +2146,14 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)));
                     }
 
                     // 然后处理数据流
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                tracer.mark_first_token();
+                                settlement.tracer.mark_first_token();
                                 sent_bytes += chunk.len() as u64;
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
@@ -2112,67 +2173,51 @@ fn create_buffered_sse_stream(
                                         }
                                     }
                                 }
+                                // 刷新用量快照：客户端在缓冲期断开时，Drop 兜底据此记账
+                                settlement.update(&ctx, sent_bytes);
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                settlement.update(&ctx, sent_bytes);
                                 // 缓冲模式 chunk 读取失败：上游中途断流
-                                tracer.finalize(
+                                settlement.finish(
+                                    "error",
                                     "interrupted",
                                     Some(outcome::STREAM_INTERRUPTED),
                                     Some(&e.to_string()),
                                     Some(sent_bytes),
-                                    TraceUsage {
-                                        input_tokens: i.max(0) as u64,
-                                        output_tokens: o.max(0) as u64,
-                                        cache_creation_tokens: cc.max(0) as u64,
-                                        cache_read_tokens: cr.max(0) as u64,
-                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                        source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
-                                    },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
                                 // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
                                 // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
                                 let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
-                                let trace_usage = TraceUsage {
-                                    input_tokens: i.max(0) as u64,
-                                    output_tokens: o.max(0) as u64,
-                                    cache_creation_tokens: cc.max(0) as u64,
-                                    cache_read_tokens: cr.max(0) as u64,
-                                    credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                    source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
-                                };
+                                settlement.update(&ctx, sent_bytes);
                                 if let Some(message) = ctx.tool_json_error_message() {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                    tracer.finalize(
+                                    settlement.finish(
+                                        "error",
                                         "error",
                                         Some(outcome::BAD_REQUEST),
                                         Some(&message),
                                         None,
-                                        trace_usage,
                                     );
                                 } else {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "success");
-                                    tracer.finalize("success", None, None, None, trace_usage);
+                                    settlement.finish("success", "success", None, None, None);
                                 }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                             }
                         }
                     }
@@ -2181,6 +2226,113 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+/// 从 BufferedStreamContext 提取用量快照（与 stream_trace_usage 同源）
+fn buffered_trace_usage(ctx: &BufferedStreamContext) -> TraceUsage {
+    let (input, output, cache_creation, cache_read, credits) = ctx.final_usage();
+    TraceUsage {
+        input_tokens: input.max(0) as u64,
+        output_tokens: output.max(0) as u64,
+        cache_creation_tokens: cache_creation.max(0) as u64,
+        cache_read_tokens: cache_read.max(0) as u64,
+        source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
+        credits: if credits.is_finite() && credits > 0.0 {
+            credits
+        } else {
+            0.0
+        },
+    }
+}
+
+/// 缓冲流（`/cc/v1`）的 exactly-once 收尾，与 StreamSettlement 同构。
+///
+/// 缓冲模式在等待上游期间只发 ping、不向客户端交付内容。客户端此时断开会让 unfold
+/// future 在 await 处被丢弃，三个 match 分支里的内联收尾全部走不到；没有兜底就会
+/// 静默丢掉已向上游产生的用量，trace 也不会留痕。
+///
+/// `sent_bytes` 在缓冲模式下是已从上游读入的字节数（此时尚未交付客户端）。
+struct BufferedStreamSettlement {
+    hook: UsageRecordHook,
+    credential_id: u64,
+    tracer: std::sync::Arc<RequestTracer>,
+    usage: TraceUsage,
+    sent_bytes: u64,
+    settled: bool,
+}
+
+impl BufferedStreamSettlement {
+    fn new(
+        hook: UsageRecordHook,
+        credential_id: u64,
+        tracer: std::sync::Arc<RequestTracer>,
+        ctx: &BufferedStreamContext,
+    ) -> Self {
+        Self {
+            hook,
+            credential_id,
+            tracer,
+            usage: buffered_trace_usage(ctx),
+            sent_bytes: 0,
+            settled: false,
+        }
+    }
+
+    fn update(&mut self, ctx: &BufferedStreamContext, sent_bytes: u64) {
+        self.usage = buffered_trace_usage(ctx);
+        self.sent_bytes = sent_bytes;
+    }
+
+    fn finish(
+        &mut self,
+        usage_status: &str,
+        trace_status: &str,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        interrupted_after_bytes: Option<u64>,
+    ) {
+        if self.settled {
+            return;
+        }
+        self.record_usage(usage_status);
+        self.tracer.finalize(
+            trace_status,
+            error_type,
+            error_message,
+            interrupted_after_bytes,
+            self.usage,
+        );
+        self.settled = true;
+    }
+
+    fn record_usage(&self, status: &str) {
+        self.hook.record(
+            self.credential_id,
+            self.usage.input_tokens.min(i32::MAX as u64) as i32,
+            self.usage.output_tokens.min(i32::MAX as u64) as i32,
+            self.usage.cache_creation_tokens.min(i32::MAX as u64) as i32,
+            self.usage.cache_read_tokens.min(i32::MAX as u64) as i32,
+            self.usage.credits,
+            status,
+        );
+    }
+}
+
+impl Drop for BufferedStreamSettlement {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.record_usage("error");
+        self.tracer.finalize(
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some("response stream was cancelled before completion"),
+            Some(self.sent_bytes),
+            self.usage,
+        );
+        self.settled = true;
+    }
 }
 
 #[cfg(test)]
@@ -2232,6 +2384,63 @@ mod tests {
         assert_eq!(overview.today_credits, 0.5);
     }
 
+    /// 缓冲流（/cc/v1）在客户端于缓冲期断开时：Drop 必须记账 + 落 trace，
+    /// 且已产生的用量不能丢（与 /v1 的 StreamSettlement 行为一致）。
+    #[test]
+    fn dropped_buffered_stream_settles_usage_and_trace() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw)
+            .with_usage(None, None, Some(aggregator.clone()))
+            .with_trace_store(Some(store.clone()));
+        let hook = UsageRecordHook::from_state(&state, 0, "test-model".to_string());
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: KeyContext {
+                    key_id: 0,
+                    group: None,
+                    key_source: TraceKeySource::MasterApiKey,
+                    client_ip: None,
+                },
+                model: "test-model".to_string(),
+                is_stream: true,
+            },
+        ));
+        let mut ctx = BufferedStreamContext::new(
+            "test-model",
+            11,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.set_cache_usage(super::super::cache_metering::CacheUsage::default());
+
+        let mut settlement = BufferedStreamSettlement::new(hook, 42, tracer, &ctx);
+        settlement.update(&ctx, 456);
+        drop(settlement);
+
+        // 用量必须落账（不能因取消而丢失）
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 1);
+
+        // trace 必须留痕，且归类为流中断（而非 abandoned_before_headers）
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(records[0].final_status, "interrupted");
+        assert_eq!(
+            records[0].error_type.as_deref(),
+            Some(outcome::STREAM_INTERRUPTED)
+        );
+        assert_eq!(records[0].interrupted_after_bytes, Some(456));
+    }
+
     #[test]
     fn tracer_renumbers_attempts_across_provider_rounds_before_persisting() {
         use crate::admin::trace_db::{TraceQuery, TraceStore};
@@ -2250,6 +2459,8 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -2321,6 +2532,8 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
 
         tracer.mark_first_token();
@@ -2353,6 +2566,8 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,
@@ -2385,6 +2600,125 @@ mod tests {
         assert_eq!(record.total_attempts, 2);
         assert_eq!(record.attempts[0].endpoint, "ide");
         assert_eq!(record.attempts[1].endpoint, "cli");
+    }
+
+    /// 从未显式 finalize → Drop 兜底补一条 abandoned 记录（attempts=0 / first_token=None）。
+    #[test]
+    fn tracer_drop_records_abandoned_when_never_finalized() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let _tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "abandoned-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "claude-sonnet-5".to_string(),
+                is_stream: true,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                client_ip: None,
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            // 不调用任何 finalize，直接离开作用域触发 Drop
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "Drop 应兜底落一行");
+        let record = &records[0];
+        assert_eq!(record.final_status, "interrupted");
+        assert_eq!(
+            record.error_type.as_deref(),
+            Some(outcome::ABANDONED_BEFORE_HEADERS)
+        );
+        assert_eq!(record.total_attempts, 0);
+        assert_eq!(record.first_token_ms, None);
+        assert_eq!(record.interrupted_after_bytes, None);
+    }
+
+    /// provider 已返回 response headers 后、body 收尾前请求被取消：不能误报为等头阶段
+    /// 中断。这个覆盖非流式 body 读取，以及未来忘记安装 stream settlement 的新路径。
+    #[test]
+    fn tracer_drop_records_stream_interrupted_after_headers_arrive() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "headers-arrived-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "claude-sonnet-5".to_string(),
+                is_stream: true,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                client_ip: None,
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            tracer.mark_upstream_headers_received();
+            // 不调用 finalize，直接离开作用域模拟 headers 已到后 handler/body 被取消。
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "Drop 应兜底落一行");
+        assert_eq!(records[0].final_status, "interrupted");
+        assert_eq!(
+            records[0].error_type.as_deref(),
+            Some(outcome::STREAM_INTERRUPTED)
+        );
+        assert_eq!(records[0].first_token_ms, None);
+    }
+
+    /// 已显式 finalize 的请求：Drop 走幂等守卫，不得再写第二行、也不得覆盖原记录。
+    #[test]
+    fn tracer_drop_is_noop_when_already_finalized() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "finalized-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "claude-sonnet-5".to_string(),
+                is_stream: false,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                client_ip: None,
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            tracer.finalize("success", None, None, None, TraceUsage::zero());
+            // 离开作用域触发 Drop —— 应被幂等守卫拦下
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "已 finalize 后 Drop 不得再写一行");
+        assert_eq!(records[0].final_status, "success");
+        assert_eq!(records[0].error_type, None);
     }
 
     #[test]
