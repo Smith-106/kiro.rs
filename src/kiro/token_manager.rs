@@ -1250,6 +1250,8 @@ pub struct MultiTokenManager {
     self_heal_min_interval_secs: AtomicU64,
     /// 连续自愈最大轮数（0=不限，运行时可修改）
     self_heal_max_consecutive_rounds: AtomicU32,
+    /// 月度额度重置后自动恢复 QuotaExceeded 凭据（运行时可修改）
+    quota_reset_recovery_enabled: AtomicBool,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1474,6 +1476,7 @@ impl MultiTokenManager {
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
+        let quota_reset_recovery_enabled = config.quota_reset_recovery_enabled;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1496,6 +1499,7 @@ impl MultiTokenManager {
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
             self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
+            quota_reset_recovery_enabled: AtomicBool::new(quota_reset_recovery_enabled),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             model_cache: Mutex::new(HashMap::new()),
@@ -3358,6 +3362,58 @@ impl MultiTokenManager {
             entry.clear_self_heal_streak();
         }
         self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 在上游计费周期重置后恢复此前因额度耗尽而禁用的凭据。
+    ///
+    /// 这是一个严格的状态转换：只允许 `QuotaExceeded` → 可用，绝不影响手动
+    /// 禁用、账号封禁、Token 失效等其它禁用原因。调用方必须已从上游余额接口
+    /// 确认该凭据恢复了可用额度。
+    pub fn recover_quota_exceeded(&self, id: u64) -> anyhow::Result<bool> {
+        let recovered = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if !entry.disabled || entry.disabled_reason != Some(DisabledReason::QuotaExceeded) {
+                return Ok(false);
+            }
+            entry.disabled = false;
+            entry.disabled_reason = None;
+            entry.failure_count = 0;
+            entry.refresh_failure_count = 0;
+            entry.throttled_until = None;
+            entry.clear_self_heal_streak();
+            true
+        };
+        if recovered {
+            self.persist_credentials()?;
+            tracing::info!("凭据 #{} 额度已恢复，重新加入调度", id);
+        }
+        Ok(recovered)
+    }
+
+    /// 是否允许在上游月度额度重置后自动恢复 QuotaExceeded 凭据。
+    pub fn quota_reset_recovery_enabled(&self) -> bool {
+        self.quota_reset_recovery_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 更新月度额度自动恢复开关，并持久化到 config.json。
+    pub fn set_quota_reset_recovery_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let previous = self.quota_reset_recovery_enabled.swap(enabled, Ordering::Relaxed);
+        if previous == enabled {
+            return Ok(());
+        }
+        if let Err(error) = self.update_config_file(move |config| {
+            config.quota_reset_recovery_enabled = enabled;
+        }) {
+            self.quota_reset_recovery_enabled
+                .store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        tracing::info!(enabled, "月度额度自动恢复配置已更新");
         Ok(())
     }
 
@@ -5542,6 +5598,40 @@ mod tests {
         // 手动重置可恢复（误判逃生途径）
         manager.reset_and_enable(1).unwrap();
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn quota_exceeded_recovers_only_from_quota_disabled_state() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.report_quota_exhausted(1);
+        assert!(manager.recover_quota_exceeded(1).unwrap());
+        let first = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 1)
+            .unwrap();
+        assert!(!first.disabled);
+        assert_eq!(first.disabled_reason, None);
+
+        manager.report_suspended(2);
+        assert!(!manager.recover_quota_exceeded(2).unwrap());
+        let second = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 2)
+            .unwrap();
+        assert!(second.disabled);
+        assert_eq!(second.disabled_reason.as_deref(), Some("Suspended"));
     }
 
     #[test]
