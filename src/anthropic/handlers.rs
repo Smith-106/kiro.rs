@@ -489,7 +489,12 @@ fn resolve_non_stream_usage(
         );
     }
 
-    let total_input = context_total_input_tokens.unwrap_or(fallback_total_input_tokens);
+    // contextUsage 覆盖生成结束后的整个上下文（含本轮输出），分摊前先扣掉输出。
+    let total_input = token::input_tokens_excluding_output(
+        context_total_input_tokens,
+        fallback_total_input_tokens,
+        fallback_output_tokens,
+    );
     let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input);
     (
         input,
@@ -2690,10 +2695,27 @@ mod tests {
             prompt_total_est: 100,
         };
 
+        // context 80 - output 9 = 71，再按 50/100 分摊：35 / 18 / 18。
+        // output_tokens 字段本身不受扣减影响，仍是 9。
         assert_eq!(
             resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
-            (40, 9, 20, 20)
+            (35, 9, 18, 18)
         );
+        let (input, _, creation, read) =
+            resolve_non_stream_usage(100, Some(80), 9, cache_usage, None);
+        assert_eq!(
+            input + creation + read,
+            71,
+            "分摊必须发生在扣减之后，三份之和等于修正后的 total"
+        );
+        // output 必须取正数：若传 -9，错实现（对 fallback 分支也扣减）因
+        // output.max(0) == 0 而照样得到 100，这条断言就失去鉴别力。
+        // 取 9 后，错实现会得到 91，与期望的 100 不符，立刻暴露。
+        assert_eq!(
+            resolve_non_stream_usage(100, None, 9, Default::default(), None),
+            (100, 9, 0, 0)
+        );
+        // 负输出的 clamp 另行单独覆盖（口径与上一条互不干扰）。
         assert_eq!(
             resolve_non_stream_usage(100, None, -9, Default::default(), None),
             (100, 0, 0, 0)
