@@ -7554,6 +7554,42 @@ mod tests {
         );
     }
 
+    /// 回归：持续失败但不会被禁用的凭据（无专属代理的网络错误、408/429/5xx 都既不
+    /// 计成功也不计失败），其 success_count 永远最低。旧实现取最小会让每个请求、
+    /// 以及同一请求的每次重试都选中它，健康凭据完全不参与故障转移。
+    #[tokio::test]
+    async fn balanced_failing_credential_does_not_trap_requests_and_retries() {
+        let manager = balanced_manager(vec![
+            grouped_cred("broken-proxy", &[]),
+            grouped_cred("healthy-a", &[]),
+            grouped_cred("healthy-b", &[]),
+        ]);
+        for _ in 0..50 {
+            manager.report_success(2);
+            manager.report_success(3);
+        }
+
+        // 模拟 provider 的重试循环：每次尝试都重新选号；#1 失败时不上报
+        // （与 provider 对无专属代理网络错误 / 瞬态 5xx 的处理一致）。
+        const MAX_ATTEMPTS: usize = 4; // provider::MAX_TOTAL_RETRIES
+        let mut succeeded = 0;
+        for _ in 0..200 {
+            for _ in 0..MAX_ATTEMPTS {
+                let ctx = manager.acquire_context(None, None).await.unwrap();
+                if ctx.id != 1 {
+                    manager.report_success(ctx.id);
+                    succeeded += 1;
+                    break;
+                }
+            }
+        }
+        // 随机下单个请求 4 次都落到 #1 的概率 (1/3)^4 ≈ 1.2%，期望成功约 197 次
+        assert!(
+            succeeded >= 180,
+            "健康凭据应接住绝大多数请求，实际成功 {succeeded}/200"
+        );
+    }
+
     /// balanced 随机只在可用凭据中选：模型缓存明确不支持、禁用的凭据不会被选到。
     #[test]
     fn balanced_random_pick_respects_availability() {
