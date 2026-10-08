@@ -25,7 +25,7 @@ function outcomeStyle(outcome: string | null): {
     case "quota_exhausted":
       return { label: "额度耗尽", variant: "warning" };
     case "account_throttled":
-      return { label: "账号风控", variant: "warning" };
+      return { label: "账号限流", variant: "warning" };
     case "auth_failed":
       return { label: "鉴权失败", variant: "destructive" };
     case "transient":

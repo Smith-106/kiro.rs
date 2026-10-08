@@ -181,17 +181,24 @@ pub struct Config {
     #[serde(default = "default_session_affinity_ttl_secs")]
     pub session_affinity_ttl_secs: u64,
 
-    /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
+    /// 账号级 429 限流触发时是否冷却当前凭据并故障转移（默认 true）。
     ///
-    /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
-    /// 开启后：识别到 suspicious activity 字符串时，把当前凭据冷却 `account_throttle_cooldown_secs` 秒，
-    /// 立即切换到下一个可用凭据。
+    /// 适用于 USER_REQUEST_RATE_EXCEEDED、CREDIT_CONSUMPTION_RATE_EXCEEDED
+    /// 和 suspicious activity 等明确绑定账号的 429。关闭后直接返回客户端，不会由
+    /// `model_api_429_retry_enabled` 在原账号上继续重试。
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
-    /// 账号级风控冷却时长（秒，默认 1800 = 30 分钟）。
+    /// 账号级 429 限流冷却时长（秒，默认 1800 = 30 分钟）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
+
+    /// 普通模型 API 429 是否由中转侧自动重试（默认 true）。
+    ///
+    /// 仅控制不需要切换凭据的容量类 429（如 `INSUFFICIENT_MODEL_CAPACITY`）。
+    /// 关闭后首个普通 429 立即返回客户端；账号级故障转移不受影响。
+    #[serde(default = "default_model_api_429_retry_enabled")]
+    pub model_api_429_retry_enabled: bool,
 
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
@@ -367,6 +374,10 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_model_api_429_retry_enabled() -> bool {
+    true
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -454,6 +465,7 @@ impl Default for Config {
             session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
@@ -604,6 +616,20 @@ mod tests {
         let default = Config::default();
         assert!(!default.account_rpm_limit_enabled);
         assert_eq!(default.account_rpm_limit, 60);
+    }
+
+    #[test]
+    fn model_api_429_retry_defaults_to_enabled_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.model_api_429_retry_enabled);
+        assert!(Config::default().model_api_429_retry_enabled);
+    }
+
+    #[test]
+    fn model_api_429_retry_accepts_explicitly_disabled() {
+        let config: Config =
+            serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
+        assert!(!config.model_api_429_retry_enabled);
     }
 
     #[test]
