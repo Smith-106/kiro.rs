@@ -3104,8 +3104,8 @@ mod tests {
                 let src = std::fs::read_to_string(&p).expect("read rs file");
                 for (idx, _) in src.match_indices(SSE_CONTENT_TYPE) {
                     checked += 1;
-                    // 头部块紧邻 content-type，取后续一小段足够覆盖整个 builder 链
-                    let tail = &src[idx..src.len().min(idx + 400)];
+                    // 头部块紧邻 content-type；按字符截取，避免切断中文注释的 UTF-8 编码。
+                    let tail: String = src[idx..].chars().take(400).collect();
                     if !tail.contains(NO_BUFFERING) {
                         let line = src[..idx].lines().count();
                         missing.push(format!("{}:{}", p.display(), line));
