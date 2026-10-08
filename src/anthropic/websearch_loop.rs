@@ -475,6 +475,9 @@ async fn run_round(
             });
         }
     };
+    // `call_api_stream` 成功返回即已收到上游 HTTP response headers；在 decode_round
+    // 读取 body 前标记，确保该窗口取消时不会被 RequestTracer::Drop 误归为等头中断。
+    tracer.mark_upstream_headers_received();
     let credential_id = call_result.credential_id;
     let mut outcome = decode_round(
         call_result.response,
