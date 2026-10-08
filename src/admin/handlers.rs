@@ -28,7 +28,7 @@ use super::{
         SetGlobalProxyRequest,
         SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetSelfHealConfigRequest,
+        SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -602,6 +602,22 @@ pub async fn set_account_rpm_limit_config(
     match state.service.set_account_rpm_limit_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/quota-reset-recovery
+pub async fn get_quota_reset_recovery_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_quota_reset_recovery_config())
+}
+
+/// PUT /api/admin/config/quota-reset-recovery
+pub async fn set_quota_reset_recovery_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetQuotaResetRecoveryConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_quota_reset_recovery_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 
