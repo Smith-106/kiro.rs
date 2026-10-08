@@ -5,6 +5,8 @@ import {
   useSetModelApiRetryConfig,
   useAccountRpmLimitConfig,
   useSetAccountRpmLimitConfig,
+  useQuotaResetRecoveryConfig,
+  useSetQuotaResetRecoveryConfig,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
   useSelfHealConfig,
@@ -38,6 +40,7 @@ export function DispatchSection() {
       <LoadBalancingGroup />
       <RateLimitHandlingGroup />
       <RpmLimitGroup />
+      <QuotaResetRecoveryGroup />
       <SelfHealGroup />
     </div>
   )
@@ -177,6 +180,34 @@ function RpmLimitGroup() {
         pending={saver.isSaving('limit')}
         saved={saver.isSaved('limit')}
         disabled={isLoading || !enabled}
+      />
+    </SettingGroup>
+  )
+}
+
+function QuotaResetRecoveryGroup() {
+  const { data, isLoading } = useQuotaResetRecoveryConfig()
+  const { mutate } = useSetQuotaResetRecoveryConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const enabled = data?.enabled ?? false
+
+  return (
+    <SettingGroup
+      title="月度额度恢复"
+      description="因额度耗尽被禁用的凭据，是否在下个账期自动恢复调度"
+    >
+      <SettingSwitch
+        label="自动恢复额度耗尽凭据"
+        hint={
+          enabled
+            ? '到凭据额度重置时间后复查余额，确认恢复额度后重新加入调度'
+            : '保持禁用，需在凭据管理中手动启用'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', { enabled: next })}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading}
       />
     </SettingGroup>
   )

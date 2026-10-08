@@ -22,6 +22,8 @@ import {
   setModelApiRetryConfig,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
+  getQuotaResetRecoveryConfig,
+  setQuotaResetRecoveryConfig,
   getSelfHealConfig,
   setSelfHealConfig,
   getLogGovernanceConfig,
@@ -317,6 +319,23 @@ export function useSetAccountRpmLimitConfig() {
     mutationFn: setAccountRpmLimitConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountRpmLimitConfig'] })
+    },
+  })
+}
+
+export function useQuotaResetRecoveryConfig() {
+  return useQuery({
+    queryKey: ['quotaResetRecoveryConfig'],
+    queryFn: getQuotaResetRecoveryConfig,
+  })
+}
+
+export function useSetQuotaResetRecoveryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setQuotaResetRecoveryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['quotaResetRecoveryConfig'] })
     },
   })
 }

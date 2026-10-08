@@ -296,7 +296,7 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 同 1M
+/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 同 1M
 ///
 /// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
 /// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
@@ -330,6 +330,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
                 || mapped == "claude-opus-5"
+                || mapped == "claude-opus-5.5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000
@@ -2178,6 +2179,20 @@ mod tests {
             map_model("claude-sonnet-5-2"),
             Some("claude-sonnet-5.2".to_string())
         );
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5.5-latest",
+            "claude-opus-5-5-20270101",
+            "CLAUDE-OPUS-5-5",
+        ] {
+            assert_eq!(
+                map_model(model),
+                Some("claude-opus-5.5".to_string()),
+                "{model} 应映射到 claude-opus-5.5"
+            );
+        }
         assert_eq!(
             map_model("claude-opus-5-beta"),
             Some("claude-opus-5-beta".to_string())
@@ -2213,6 +2228,8 @@ mod tests {
             "claude-opus-4-7",
             "claude-opus-4-8",
             "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-opus-5.5-thinking",
             "claude-fable-5",
         ] {
             assert_eq!(
@@ -2369,6 +2386,26 @@ mod tests {
                 .model_id,
             "glm-5"
         );
+    }
+
+    #[test]
+    fn test_opus_5_5_maps_upstream_id_and_keeps_xhigh() {
+        let req =
+            minimal_adaptive_thinking_request_with_effort("claude-opus-5-5-thinking", "xhigh");
+        let result = convert_request(&req).unwrap();
+
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-opus-5.5"
+        );
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 5.5 adaptive thinking should keep output_config");
+        assert_eq!(fields.output_config.unwrap().effort, "xhigh");
     }
 
     #[test]
@@ -2539,6 +2576,7 @@ mod tests {
             "claude-sonnet-4.6",
             "claude-fable-5",
             "claude-sonnet-5",
+            "claude-opus-5.5",
         ] {
             assert!(model_supports_native_reasoning(m), "{m} 应支持原生 reasoning");
         }

@@ -28,7 +28,7 @@ use super::{
         SetGlobalProxyRequest,
         SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetModelApiRetryConfigRequest,
+        SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest,
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
@@ -344,6 +344,7 @@ pub async fn batch_import_credentials(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(body))
         .unwrap()
@@ -620,6 +621,22 @@ pub async fn set_account_rpm_limit_config(
     match state.service.set_account_rpm_limit_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/quota-reset-recovery
+pub async fn get_quota_reset_recovery_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_quota_reset_recovery_config())
+}
+
+/// PUT /api/admin/config/quota-reset-recovery
+pub async fn set_quota_reset_recovery_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetQuotaResetRecoveryConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_quota_reset_recovery_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

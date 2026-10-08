@@ -504,6 +504,22 @@ export async function setAccountRpmLimitConfig(
   return data
 }
 
+export interface QuotaResetRecoveryConfig {
+  enabled: boolean
+}
+
+export async function getQuotaResetRecoveryConfig(): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.get<QuotaResetRecoveryConfig>('/config/quota-reset-recovery')
+  return data
+}
+
+export async function setQuotaResetRecoveryConfig(
+  patch: Partial<QuotaResetRecoveryConfig>,
+): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.put<QuotaResetRecoveryConfig>('/config/quota-reset-recovery', patch)
+  return data
+}
+
 // 自愈治理配置。suspendedDetectionEnabled/enabled/minIntervalSecs/maxConsecutiveRounds
 // 可写；consecutiveRounds 为凭据最大连续轮数，totalCount 为累计恢复凭据次数。
 export interface SelfHealConfig {

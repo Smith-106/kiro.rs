@@ -246,6 +246,14 @@ pub struct Config {
     #[serde(default = "default_self_heal_max_consecutive_rounds")]
     pub self_heal_max_consecutive_rounds: u32,
 
+    /// 是否在上游月度额度重置后自动恢复 `QuotaExceeded` 凭据（默认 false）。
+    ///
+    /// 开启后，后台余额任务仅在该凭据的 `nextResetAt` 到期时复查它自己；确认
+    /// `remaining > 0` 后才恢复调度。关闭时，`QuotaExceeded` 凭据保持禁用，
+    /// 需管理员手动恢复。
+    #[serde(default)]
+    pub quota_reset_recovery_enabled: bool,
+
     /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
@@ -464,6 +472,7 @@ impl Default for Config {
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
+            quota_reset_recovery_enabled: false,
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
@@ -588,6 +597,14 @@ mod tests {
         assert!(!config.self_heal_enabled);
         assert_eq!(config.self_heal_min_interval_secs, 60);
         assert_eq!(config.self_heal_max_consecutive_rounds, 0);
+    }
+
+    #[test]
+    fn quota_reset_recovery_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.quota_reset_recovery_enabled);
+        let config: Config = serde_json::from_str(r#"{"quotaResetRecoveryEnabled":true}"#).unwrap();
+        assert!(config.quota_reset_recovery_enabled);
     }
 
     #[test]
